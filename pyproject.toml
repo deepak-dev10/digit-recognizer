@@ -4,10 +4,26 @@ version = "0.1.0"
 description = "Recognize handwritten digits in photos using a pluggable PyTorch model backend."
 readme = "README.md"
 # 3.13 is the target; drop to ">=3.12" if a required wheel (e.g. torch) is missing for 3.13.
+# The exact interpreter is pinned in .python-version. Use a uv-managed build
+# (`uv python install 3.13`): some pyenv builds lack the `_lzma` module, which torchvision needs.
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "numpy>=2.5.5",
+    "opencv-python>=5.0.0.93",
+    "pillow>=13.0.0",
+    "streamlit>=1.67.0",
+    "streamlit-drawable-canvas>=0.13.0",
+    "torch>=2.15.0",
+    "torchvision>=0.29.2",
+    "transformers>=5.23.0",
+]
 
 [build-system]
 # uv's own build backend; it expects the package at src/<name>/ (src layout).
 requires = ["uv_build>=0.13,<0.14"]
 build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+]
