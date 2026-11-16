@@ -10,6 +10,7 @@ This module is built in small steps. So far:
 
 * :func:`load_image`: any supported input, turned into a 2-D ``uint8`` grayscale array.
 * :func:`binarize`: denoise and threshold to pure black/white (0 or 255).
+* :func:`ensure_white_on_black`: invert if needed so the digit is white on black, like MNIST.
 """
 
 from __future__ import annotations
@@ -164,3 +165,57 @@ def binarize(
         )
 
     raise ValueError(f"unknown threshold method {method!r}; expected 'otsu' or 'adaptive'")
+
+
+def background_is_light(image: np.ndarray, *, border_frac: float = 0.05) -> bool:
+    """Guess whether the background is light (e.g. paper) by looking at the image border.
+
+    The edges of a digit photo are almost always background, so the border pixels tell us
+    the background colour without having to find the digit first.
+
+    The decision is "is the **median** border pixel brighter than mid-grey?", which amounts
+    to "are most border pixels light?". A stroke touching the edge (common with the drawing
+    canvas or a tightly cropped photo) can't flip it unless it covers half the border.
+    On a binary image this is the same as comparing the mean. On a *grayscale* image the
+    median is more robust: dark strokes on the edge pull the mean down, so dim paper
+    (e.g. grey 150) with ink along part of the border could fall below 127 and be misjudged.
+    The median stays at the paper's value.
+
+    Args:
+        image: ``HxW`` ``uint8`` image, binary or grayscale.
+        border_frac: Border thickness as a fraction of the shorter side (at least 1 px).
+
+    Returns:
+        ``True`` if the median border pixel is brighter than mid-grey (> 127).
+    """
+    if image.ndim != 2:
+        raise ValueError(f"expected a 2-D image, got shape {image.shape}")
+
+    t = max(1, round(min(image.shape) * border_frac))
+    border = np.concatenate([
+        image[:t, :].ravel(),     # top rows
+        image[-t:, :].ravel(),    # bottom rows
+        image[:, :t].ravel(),     # left columns (corners counted twice; harmless for a median)
+        image[:, -t:].ravel(),    # right columns
+    ])
+    return bool(np.median(border) > 127)
+
+
+def ensure_white_on_black(image: np.ndarray, *, border_frac: float = 0.05) -> np.ndarray:
+    """Return the image with a white digit on a black background (stage 2b).
+
+    MNIST digits are white (255) strokes on black (0). Photos of handwriting are the
+    opposite (dark ink on light paper), while the drawing canvas may be either depending
+    on its colours. This function inverts only when :func:`background_is_light` says so,
+    so already-correct input passes through unchanged.
+
+    Args:
+        image: ``HxW`` ``uint8`` image, normally the output of :func:`binarize`.
+        border_frac: Passed to :func:`background_is_light`.
+
+    Returns:
+        A new array (the input is never modified) with a dark background.
+    """
+    if background_is_light(image, border_frac=border_frac):
+        return 255 - image  # uint8 subtraction never wraps here: 255 - x is in 0..255
+    return image.copy()

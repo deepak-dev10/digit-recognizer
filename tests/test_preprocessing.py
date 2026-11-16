@@ -6,7 +6,12 @@ import numpy as np
 import pytest
 from PIL import Image, UnidentifiedImageError
 
-from digitrec.preprocessing import binarize, load_image
+from digitrec.preprocessing import (
+    background_is_light,
+    binarize,
+    ensure_white_on_black,
+    load_image,
+)
 
 # --- load_image ---------------------------------------------------------------------------
 
@@ -145,3 +150,75 @@ def test_binarize_rejects_bad_input():
         binarize(np.zeros((5, 5, 3), np.uint8))
     with pytest.raises(ValueError, match="unknown threshold method"):
         binarize(np.zeros((5, 5), np.uint8), method="magic")  # type: ignore[arg-type]
+
+
+# --- background_is_light / ensure_white_on_black ------------------------------------------
+
+
+def _binary_digit(dark_on_light=True, size=50) -> np.ndarray:
+    """Binary image with a vertical bar 'digit' in the middle."""
+    paper, ink = (255, 0) if dark_on_light else (0, 255)
+    img = np.full((size, size), paper, np.uint8)
+    img[10:40, 22:28] = ink
+    return img
+
+
+def test_dark_on_light_is_inverted():
+    img = _binary_digit(dark_on_light=True)
+    out = ensure_white_on_black(img)
+    assert background_is_light(img)
+    assert out[0, 0] == 0 and out[25, 25] == 255  # black background, white digit
+
+
+def test_white_on_black_is_unchanged():
+    img = _binary_digit(dark_on_light=False)
+    out = ensure_white_on_black(img)
+    assert not background_is_light(img)
+    np.testing.assert_array_equal(out, img)
+    assert out is not img  # always a new array
+
+
+def test_input_is_not_modified():
+    img = _binary_digit(dark_on_light=True)
+    before = img.copy()
+    ensure_white_on_black(img)
+    np.testing.assert_array_equal(img, before)
+
+
+def test_stroke_touching_border_does_not_flip_decision():
+    """A binary stroke running off the top and bottom edges (as on a tightly cropped canvas)."""
+    img = np.full((50, 50), 255, np.uint8)
+    img[:, 20:30] = 0  # ink touches the top and bottom border
+    assert background_is_light(img)
+    assert ensure_white_on_black(img)[0, 0] == 0
+
+
+def test_median_handles_dim_paper_with_ink_on_border():
+    """Grayscale case where a mean-based check would get it wrong.
+
+    Dim paper (150) with black ink along ~1/3 of the border: the border mean drops to
+    ~100 (below 127, so it would look "dark"), but most border pixels are still paper.
+    """
+    img = np.full((60, 60), 150, np.uint8)
+    img[:, :20] = 0  # thick dark stroke along the whole left third
+    t = 3            # border thickness used for a 60 px image (5%)
+    border = np.concatenate([img[:t].ravel(), img[-t:].ravel(), img[:, :t].ravel(), img[:, -t:].ravel()])
+    assert border.mean() < 127  # mean-based check would misjudge…
+    assert background_is_light(img)  # …the median-based one gets it right
+
+
+def test_works_on_grayscale():
+    img = np.full((30, 30), 200, np.uint8)  # light-grey paper
+    img[10:20, 10:20] = 50                  # dark-grey ink
+    out = ensure_white_on_black(img)
+    assert out[0, 0] == 55 and out[15, 15] == 205
+
+
+def test_tiny_image_uses_at_least_one_pixel_border():
+    assert background_is_light(np.full((2, 2), 255, np.uint8))
+    assert not background_is_light(np.zeros((2, 2), np.uint8))
+
+
+def test_background_is_light_rejects_color():
+    with pytest.raises(ValueError, match="2-D"):
+        background_is_light(np.zeros((5, 5, 3), np.uint8))
