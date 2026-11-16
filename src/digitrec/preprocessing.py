@@ -11,6 +11,7 @@ This module is built in small steps. So far:
 * :func:`load_image`: any supported input, turned into a 2-D ``uint8`` grayscale array.
 * :func:`binarize`: denoise and threshold to pure black/white (0 or 255).
 * :func:`ensure_white_on_black`: invert if needed so the digit is white on black, like MNIST.
+* :func:`crop_to_ink` + :func:`fit_to_box`: cut away empty margins, scale the digit to 20 px.
 """
 
 from __future__ import annotations
@@ -219,3 +220,77 @@ def ensure_white_on_black(image: np.ndarray, *, border_frac: float = 0.05) -> np
     if background_is_light(image, border_frac=border_frac):
         return 255 - image  # uint8 subtraction never wraps here: 255 - x is in 0..255
     return image.copy()
+
+
+class NoInkFoundError(ValueError):
+    """The image contains no digit pixels (blank page, empty canvas, or everything thresholded away).
+
+    Subclasses ``ValueError`` so generic handlers still catch it, while the CLI and UI can
+    catch it specifically and show a friendly "no digit found" message.
+    """
+
+
+#: MNIST scales every digit so its longest side is 20 px; the 28x28 frame adds a 4 px margin.
+MNIST_DIGIT_BOX = 20
+
+
+def crop_to_ink(image: np.ndarray, *, threshold: int = 0) -> np.ndarray:
+    """Crop a white-on-black image to the bounding box of its ink (stage 2c).
+
+    Removes the empty margins, so the digit's size in the photo no longer matters, only
+    its shape. Every pixel brighter than ``threshold`` counts as ink, so a stray speck far
+    from the digit enlarges the box. The blur in :func:`binarize` removes most specks; the
+    multi-digit segmenter will filter tiny blobs explicitly.
+
+    Args:
+        image: ``HxW`` ``uint8`` image with a **white digit on black**, e.g. from
+            :func:`ensure_white_on_black`.
+        threshold: Pixels with value ``> threshold`` are ink.
+
+    Returns:
+        The cropped region (a copy), tight around the ink.
+
+    Raises:
+        NoInkFoundError: No pixel is brighter than ``threshold``.
+    """
+    if image.ndim != 2:
+        raise ValueError(f"expected a 2-D image, got shape {image.shape}")
+
+    rows = np.flatnonzero((image > threshold).any(axis=1))  # indices of rows containing ink
+    cols = np.flatnonzero((image > threshold).any(axis=0))  # indices of columns containing ink
+    if rows.size == 0:
+        raise NoInkFoundError("no digit found: the image is blank after thresholding")
+
+    return image[rows[0] : rows[-1] + 1, cols[0] : cols[-1] + 1].copy()
+
+
+def fit_to_box(image: np.ndarray, box: int = MNIST_DIGIT_BOX) -> np.ndarray:
+    """Resize so the longest side is ``box`` pixels, keeping the aspect ratio (stage 2d).
+
+    Keeping the aspect ratio matters: stretching a narrow "1" to a square would make it
+    look like a thick bar, unlike anything in MNIST. The short side is rounded and kept at
+    least 1 px wide.
+
+    Interpolation:
+
+    * shrinking uses ``INTER_AREA``, which averages pixel blocks and leaves the soft grey
+      anti-aliased edges MNIST digits have (they are not pure black/white);
+    * enlarging a small crop uses ``INTER_LINEAR``, which is smooth and avoids blocky pixels.
+
+    Args:
+        image: ``HxW`` ``uint8`` image, normally the output of :func:`crop_to_ink`.
+        box: Target length of the longest side.
+
+    Returns:
+        ``uint8`` array whose longest side is exactly ``box``.
+    """
+    if image.ndim != 2 or image.size == 0:
+        raise ValueError(f"expected a non-empty 2-D image, got shape {image.shape}")
+
+    h, w = image.shape
+    scale = box / max(h, w)
+    new_h = max(1, round(h * scale))
+    new_w = max(1, round(w * scale))
+
+    interpolation = cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR
+    return cv2.resize(image, (new_w, new_h), interpolation=interpolation)  # cv2 takes (width, height)

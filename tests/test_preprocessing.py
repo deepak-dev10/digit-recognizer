@@ -7,9 +7,12 @@ import pytest
 from PIL import Image, UnidentifiedImageError
 
 from digitrec.preprocessing import (
+    NoInkFoundError,
     background_is_light,
     binarize,
+    crop_to_ink,
     ensure_white_on_black,
+    fit_to_box,
     load_image,
 )
 
@@ -222,3 +225,64 @@ def test_tiny_image_uses_at_least_one_pixel_border():
 def test_background_is_light_rejects_color():
     with pytest.raises(ValueError, match="2-D"):
         background_is_light(np.zeros((5, 5, 3), np.uint8))
+
+
+# --- crop_to_ink / fit_to_box -------------------------------------------------------------
+
+
+def test_crop_to_ink_returns_tight_box():
+    img = np.zeros((50, 40), np.uint8)
+    img[10:30, 5:15] = 255   # the digit
+    img[12, 16] = 80         # an anti-aliased grey edge pixel still counts as ink
+    cropped = crop_to_ink(img)
+    assert cropped.shape == (20, 12)  # rows 10..29, cols 5..16
+    assert cropped[0, 0] == 255
+
+
+def test_crop_to_ink_threshold_ignores_faint_pixels():
+    img = np.zeros((50, 40), np.uint8)
+    img[10:30, 5:15] = 255
+    img[45, 35] = 20  # faint speck in the corner
+    assert crop_to_ink(img).shape == (36, 31)  # speck stretches the box to rows 10..45, cols 5..35…
+    assert crop_to_ink(img, threshold=50).shape == (20, 10)  # …unless it's below the threshold
+
+
+def test_crop_to_ink_blank_image_raises():
+    with pytest.raises(NoInkFoundError, match="no digit found"):
+        crop_to_ink(np.zeros((28, 28), np.uint8))
+    assert issubclass(NoInkFoundError, ValueError)
+
+
+def test_crop_returns_copy():
+    img = np.zeros((10, 10), np.uint8)
+    img[2:5, 2:5] = 255
+    crop_to_ink(img)[0, 0] = 0
+    assert img[2, 2] == 255
+
+
+@pytest.mark.parametrize(
+    ("shape", "expected"),
+    [
+        ((100, 50), (20, 10)),   # tall digit: height becomes 20
+        ((30, 90), (7, 20)),     # wide digit: width becomes 20, 30 * 20/90 = 6.67 rounds to 7
+        ((5, 5), (20, 20)),      # small crop is enlarged
+        ((200, 2), (20, 1)),     # very thin "1": short side never drops to 0
+    ],
+)
+def test_fit_to_box_keeps_aspect_ratio(shape, expected):
+    out = fit_to_box(np.full(shape, 255, np.uint8))
+    assert out.shape == expected
+    assert out.dtype == np.uint8
+
+
+def test_fit_to_box_shrinking_creates_soft_edges():
+    """A 1-px-off-grid stroke shrunk with INTER_AREA gets grey (anti-aliased) edge pixels."""
+    img = np.zeros((100, 100), np.uint8)
+    img[:, 45:58] = 255  # 13 px stroke; 13 * 0.2 = 2.6 px after shrinking, so edges are partial
+    out = fit_to_box(img)
+    assert ((out > 0) & (out < 255)).any()
+
+
+def test_fit_to_box_rejects_empty():
+    with pytest.raises(ValueError, match="non-empty"):
+        fit_to_box(np.zeros((0, 5), np.uint8))
