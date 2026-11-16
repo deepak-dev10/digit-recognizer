@@ -12,6 +12,7 @@ This module is built in small steps. So far:
 * :func:`binarize`: denoise and threshold to pure black/white (0 or 255).
 * :func:`ensure_white_on_black`: invert if needed so the digit is white on black, like MNIST.
 * :func:`crop_to_ink` + :func:`fit_to_box`: cut away empty margins, scale the digit to 20 px.
+* :func:`center_by_mass`: place it in a 28x28 frame with its centre of mass in the middle.
 """
 
 from __future__ import annotations
@@ -294,3 +295,65 @@ def fit_to_box(image: np.ndarray, box: int = MNIST_DIGIT_BOX) -> np.ndarray:
 
     interpolation = cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR
     return cv2.resize(image, (new_w, new_h), interpolation=interpolation)  # cv2 takes (width, height)
+
+
+#: Side length of an MNIST image.
+MNIST_SIZE = 28
+
+
+def center_by_mass(digit: np.ndarray, size: int = MNIST_SIZE) -> np.ndarray:
+    """Pad a digit into a ``size x size`` black frame, centred by centre of mass (stage 2e).
+
+    The **centre of mass** is the average pixel position weighted by brightness, i.e.
+    where the ink "balances". MNIST put that point, not the bounding box centre, in the
+    middle of the frame. The two differ for lopsided digits: a "7"'s heavy top bar pulls
+    its centre of mass up, so in MNIST the 7 sits lower than its box would suggest.
+    Matching this placement is a cheap accuracy win for MNIST-trained models.
+
+    Details:
+
+    * The target is the geometric centre, ``(size - 1) / 2`` = 13.5 for 28 px (between
+      pixels 13 and 14).
+    * The shift is rounded to **whole pixels**. A sub-pixel shift would need interpolation
+      and slightly blur the strokes, for at most 0.5 px of extra accuracy.
+    * The shift is **clamped** so the whole digit stays inside the frame. With a 20 px digit
+      in a 28 px frame there are 8 px of slack. An extremely lopsided digit may therefore end
+      up slightly off-centre instead of losing strokes over the edge.
+
+    Args:
+        digit: ``HxW`` ``uint8`` white-on-black digit no larger than ``size`` in either
+            direction, normally the output of :func:`fit_to_box`.
+        size: Side of the output frame.
+
+    Returns:
+        ``size x size`` ``uint8`` array; every pixel of ``digit`` is copied unchanged.
+
+    Raises:
+        NoInkFoundError: ``digit`` is completely black (no mass to centre).
+        ValueError: ``digit`` is not 2-D or doesn't fit in the frame.
+    """
+    if digit.ndim != 2:
+        raise ValueError(f"expected a 2-D image, got shape {digit.shape}")
+    h, w = digit.shape
+    if h > size or w > size:
+        raise ValueError(f"digit {h}x{w} does not fit in a {size}x{size} frame; call fit_to_box first")
+
+    weights = digit.astype(np.float64)
+    total = weights.sum()
+    if total == 0:
+        raise NoInkFoundError("no digit found: the crop is completely black")
+
+    # Centre of mass in the digit's own coordinates (row, column).
+    cy = (weights.sum(axis=1) @ np.arange(h)) / total
+    cx = (weights.sum(axis=0) @ np.arange(w)) / total
+
+    # Where the digit's top-left corner must go so its centre of mass lands on the frame centre…
+    target = (size - 1) / 2
+    top, left = round(target - cy), round(target - cx)
+    # …clamped so the digit stays fully inside the frame.
+    top = min(max(top, 0), size - h)
+    left = min(max(left, 0), size - w)
+
+    frame = np.zeros((size, size), np.uint8)
+    frame[top : top + h, left : left + w] = digit
+    return frame

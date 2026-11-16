@@ -10,6 +10,7 @@ from digitrec.preprocessing import (
     NoInkFoundError,
     background_is_light,
     binarize,
+    center_by_mass,
     crop_to_ink,
     ensure_white_on_black,
     fit_to_box,
@@ -286,3 +287,63 @@ def test_fit_to_box_shrinking_creates_soft_edges():
 def test_fit_to_box_rejects_empty():
     with pytest.raises(ValueError, match="non-empty"):
         fit_to_box(np.zeros((0, 5), np.uint8))
+
+
+# --- center_by_mass -----------------------------------------------------------------------
+
+
+def _center_of_mass(img: np.ndarray) -> tuple[float, float]:
+    w = img.astype(float)
+    ys, xs = np.indices(img.shape)
+    return (w * ys).sum() / w.sum(), (w * xs).sum() / w.sum()
+
+
+def test_center_by_mass_output_is_28x28_uint8():
+    out = center_by_mass(np.full((20, 10), 255, np.uint8))
+    assert out.shape == (28, 28)
+    assert out.dtype == np.uint8
+
+
+def test_symmetric_digit_is_centered():
+    out = center_by_mass(np.full((20, 10), 255, np.uint8))
+    cy, cx = _center_of_mass(out)
+    assert abs(cy - 13.5) <= 0.5 and abs(cx - 13.5) <= 0.5
+
+
+def test_lopsided_digit_centered_by_mass_not_box():
+    """A '7'-like shape: a heavy top bar plus a thin stem. Its mass sits high in its box."""
+    seven = np.zeros((20, 14), np.uint8)
+    seven[:5, :] = 255       # thick top bar
+    seven[5:, 6:8] = 255     # thin stem
+    out = center_by_mass(seven)
+
+    cy, cx = _center_of_mass(out)
+    assert abs(cy - 13.5) <= 0.5 and abs(cx - 13.5) <= 0.5  # mass is centred…
+    rows_with_ink = np.flatnonzero(out.any(axis=1))
+    assert rows_with_ink[0] > 4  # …so the digit sits lower than box-centring (top row 4) would put it
+
+
+def test_shift_is_clamped_so_no_ink_is_lost():
+    """Nearly all mass in one corner: the ideal shift would push the digit off the frame."""
+    digit = np.zeros((20, 20), np.uint8)
+    digit[0, 0] = 255   # a bright dot in the top-left…
+    digit[19, 19] = 1   # …and a barely visible pixel bottom-right that defines the box
+    out = center_by_mass(digit)
+    assert out.sum() == digit.astype(int).sum()  # every pixel survived
+    assert out[0, 0] == 0 and out.max() == 255   # moved, but stayed inside
+
+
+def test_pixels_are_copied_unchanged():
+    rng = np.random.default_rng(1)
+    digit = rng.integers(0, 256, (20, 15), dtype=np.uint8)
+    out = center_by_mass(digit)
+    assert sorted(out[out > 0].tolist()) == sorted(digit[digit > 0].tolist())  # no interpolation
+
+
+def test_center_by_mass_rejects_bad_input():
+    with pytest.raises(NoInkFoundError):
+        center_by_mass(np.zeros((20, 20), np.uint8))
+    with pytest.raises(ValueError, match="does not fit"):
+        center_by_mass(np.full((30, 10), 255, np.uint8))
+    with pytest.raises(ValueError, match="2-D"):
+        center_by_mass(np.zeros((5, 5, 3), np.uint8))
