@@ -112,8 +112,55 @@ def load_image(source: ImageSource) -> np.ndarray:
     return np.asarray(image.convert("L"), dtype=np.uint8)
 
 
+class NoInkFoundError(ValueError):
+    """The image contains no digit pixels (blank page, empty canvas, or everything thresholded away).
+
+    Subclasses ``ValueError`` so generic handlers still catch it, while the CLI and UI can
+    catch it specifically and show a friendly "no digit found" message.
+    """
+
+
 #: Thresholding strategy for :func:`binarize`.
 ThresholdMethod = Literal["otsu", "adaptive"]
+
+# Contrast = gap between the mean brightness of Otsu's light and dark groups, measured
+# after blurring AND after removing slow lighting changes (see _ink_contrast).
+# Measured on synthetic 400x400 pages with sensor noise (σ 6 unless stated):
+#   blank pages:  noise σ 0–25 → 0–9.5, vignette → 5.8, gradients 245→190 / 245→120 → 3.7 / 5.6,
+#                 deep shadow 245→90 → 9.0
+#   inked pages:  marker / fine pen → 128 / 100, pencil 4 px → 56, faint pencil 2 px → 32,
+#                 very faint 2 px (ink only 30 levels darker than paper) → 18.5,
+#                 pen 4 px across a deep shadow → 73
+# Without the lighting removal, a blank page with a gradient measured 28–78 and overlapped faint pencil.
+#: Below this contrast the image is treated as blank (~5 levels of margin on each side of the data above).
+MIN_CONTRAST = 15
+
+
+def _ink_contrast(blurred: np.ndarray) -> float:
+    """How strongly the darkest/brightest marks stand out from their surroundings (0–255).
+
+    1. Estimate the **background lighting** (paper brightness, shadows, vignetting) by
+       heavily blurring the image, then subtract it. Thin strokes survive the subtraction;
+       slow brightness changes don't. Without this, a blank page with a shadow across it
+       would look like it has strong "ink".
+    2. Split the flattened image with Otsu and return the gap between the two groups' means.
+
+    The background is estimated on a small copy (shorter side 64 px) and scaled back up.
+    Lighting is smooth, so nothing is lost, and big photos don't need a huge blur kernel.
+    """
+    h, w = blurred.shape
+    scale = 64 / min(h, w)
+    if scale < 1:
+        small = cv2.resize(blurred, (max(1, round(w * scale)), max(1, round(h * scale))), interpolation=cv2.INTER_AREA)
+    else:
+        small = blurred
+    small_bg = cv2.GaussianBlur(small.astype(np.float32), (0, 0), sigmaX=min(small.shape) / 8)
+    background = cv2.resize(small_bg, (w, h), interpolation=cv2.INTER_LINEAR)
+
+    flat = np.clip(blurred.astype(np.float32) - background + 128, 0, 255).astype(np.uint8)
+    t, _ = cv2.threshold(flat, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+    dark, light = flat[flat <= t], flat[flat > t]
+    return float(light.mean() - dark.mean()) if dark.size and light.size else 0.0
 
 
 def _odd_at_least_3(n: int) -> int:
@@ -128,12 +175,19 @@ def binarize(
     method: ThresholdMethod = "otsu",
     blur_ksize: int = 5,
     adaptive_c: int = 10,
+    min_contrast: float = MIN_CONTRAST,
 ) -> np.ndarray:
     """Denoise a grayscale image and threshold it to pure black and white (stage 2a).
 
     1. **Gaussian blur** smooths sensor noise and paper texture, so stray specks don't
        survive thresholding as fake "ink".
-    2. **Threshold** sets every pixel to 0 or 255:
+    2. **Blank check.** Otsu *always* splits the histogram in two, even when there is
+       nothing to split: on an empty page it would turn sensor noise into fake ink. So we
+       first measure the **contrast**: how strongly the marks stand out once slow lighting
+       changes (shadows, vignetting) are removed, see :func:`_ink_contrast`. Below
+       ``min_contrast`` the image is treated as blank and :class:`NoInkFoundError` is
+       raised. This applies to both methods.
+    3. **Threshold** sets every pixel to 0 or 255:
 
        * ``"otsu"`` (default): one global threshold, chosen automatically to best separate
          the two brightness groups (ink and paper) in the histogram. Works well for evenly
@@ -153,9 +207,15 @@ def binarize(
         adaptive_c: Only for ``"adaptive"``. How much darker than its surroundings a
             pixel must be to count as ink. Higher values ignore faint shading but can
             break up light pen strokes.
+        min_contrast: Minimum contrast (0–255 brightness levels) to accept the image as
+            containing ink; ``0`` disables the check. The default comes from the
+            measurements next to :data:`MIN_CONTRAST`.
 
     Returns:
         ``HxW`` ``uint8`` array containing only 0 and 255.
+
+    Raises:
+        NoInkFoundError: The contrast is below ``min_contrast`` (blank or nearly blank page).
 
     Note:
         ``"adaptive"`` assumes **dark ink on a light background**, which is how real photos
@@ -163,25 +223,30 @@ def binarize(
     """
     if gray.ndim != 2 or gray.dtype != np.uint8:
         raise ValueError(f"expected a 2-D uint8 grayscale image, got {gray.dtype} {gray.shape}")
+    if method not in ("otsu", "adaptive"):
+        raise ValueError(f"unknown threshold method {method!r}; expected 'otsu' or 'adaptive'")
 
     if blur_ksize > 0:
         k = _odd_at_least_3(blur_ksize)
         gray = cv2.GaussianBlur(gray, (k, k), 0)  # sigma 0 = derived from the kernel size
+
+    contrast = _ink_contrast(gray)
+    if contrast < min_contrast:
+        raise NoInkFoundError(
+            f"no digit found: the image looks blank (contrast {contrast:.0f} < {min_contrast:g})"
+        )
 
     if method == "otsu":
         # With THRESH_OTSU, OpenCV ignores the given threshold (0) and computes its own.
         _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
         return binary
 
-    if method == "adaptive":
-        # The neighbourhood must be much larger than a pen stroke but small enough to
-        # follow a shadow. A quarter of the shorter side works for typical digit photos.
-        block_size = _odd_at_least_3(min(gray.shape) // 4)
-        return cv2.adaptiveThreshold(
-            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, block_size, adaptive_c
-        )
-
-    raise ValueError(f"unknown threshold method {method!r}; expected 'otsu' or 'adaptive'")
+    # Adaptive: the neighbourhood must be much larger than a pen stroke but small enough to
+    # follow a shadow. A quarter of the shorter side works for typical digit photos.
+    block_size = _odd_at_least_3(min(gray.shape) // 4)
+    return cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, block_size, adaptive_c
+    )
 
 
 def background_is_light(image: np.ndarray, *, border_frac: float = 0.05) -> bool:
@@ -236,14 +301,6 @@ def ensure_white_on_black(image: np.ndarray, *, border_frac: float = 0.05) -> np
     if background_is_light(image, border_frac=border_frac):
         return 255 - image  # uint8 subtraction never wraps here: 255 - x is in 0..255
     return image.copy()
-
-
-class NoInkFoundError(ValueError):
-    """The image contains no digit pixels (blank page, empty canvas, or everything thresholded away).
-
-    Subclasses ``ValueError`` so generic handlers still catch it, while the CLI and UI can
-    catch it specifically and show a friendly "no digit found" message.
-    """
 
 
 #: MNIST scales every digit so its longest side is 20 px; the 28x28 frame adds a 4 px margin.
@@ -474,11 +531,14 @@ class PreprocessOptions:
         blur_ksize: Gaussian blur kernel before thresholding; ``0`` disables it.
         thicken: Dilate thin pen strokes, see :func:`thicken_strokes`. It does nothing to
             strokes that are already MNIST-thick, so it's on by default.
+        min_contrast: Treat the image as blank below this contrast, see :func:`binarize`.
+            Lower it for very faint pencil; ``0`` disables the check.
     """
 
     threshold: ThresholdMethod = "otsu"
     blur_ksize: int = 5
     thicken: bool = True
+    min_contrast: float = MIN_CONTRAST
 
 
 @dataclass
@@ -515,7 +575,12 @@ def prepare_page(
     """
     options = options or PreprocessOptions()
     gray = load_image(source)
-    binary = binarize(gray, method=options.threshold, blur_ksize=options.blur_ksize)
+    binary = binarize(
+        gray,
+        method=options.threshold,
+        blur_ksize=options.blur_ksize,
+        min_contrast=options.min_contrast,
+    )
     page = ensure_white_on_black(binary)
     return page, {"grayscale": gray, "binary": binary, "white_on_black": page}
 

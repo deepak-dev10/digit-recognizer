@@ -504,3 +504,85 @@ def test_prepare_page_then_normalize_digit_matches_preprocess():
 def test_preprocess_blank_page_raises():
     with pytest.raises(NoInkFoundError):
         preprocess(np.full((100, 100), 240, np.uint8))
+
+
+# --- binarize: blank-page (contrast) guard ------------------------------------------------
+
+
+@pytest.mark.parametrize("sigma", [0, 4, 8, 25])
+@pytest.mark.parametrize("method", ["otsu", "adaptive"])
+def test_blank_noisy_paper_raises(sigma, method):
+    rng = np.random.default_rng(sigma)
+    page = (np.full((300, 300), 232.0) + rng.normal(0, sigma, (300, 300))).clip(0, 255).astype(np.uint8)
+    with pytest.raises(NoInkFoundError, match="looks blank"):
+        binarize(page, method=method)
+
+
+@pytest.mark.parametrize("darkest", [190, 120, 90])  # mild gradient … deep shadow
+@pytest.mark.parametrize("method", ["otsu", "adaptive"])
+def test_blank_paper_with_lighting_gradient_raises(darkest, method):
+    """Shadows and gradients are slow lighting changes, not ink, and must not count as contrast."""
+    rng = np.random.default_rng(darkest)
+    page = np.tile(np.linspace(245, darkest, 300), (300, 1)) + rng.normal(0, 6, (300, 300))
+    with pytest.raises(NoInkFoundError):
+        binarize(page.clip(0, 255).astype(np.uint8), method=method)
+
+
+def test_blank_vignette_raises():
+    yy, xx = np.indices((300, 300))
+    page = 232 - 40 * (np.hypot(yy - 150, xx - 150) / 212) ** 2  # darker corners
+    with pytest.raises(NoInkFoundError):
+        binarize(page.astype(np.uint8))
+
+
+@pytest.mark.parametrize("ink", [180, 200])  # faint pencil (contrast ~32), very faint (~18.5)
+def test_faint_pencil_is_still_accepted(ink):
+    """2 px strokes only 50 / 30 levels darker than the paper must pass the guard."""
+    img = np.full((400, 400), 230, np.uint8)
+    cv2.line(img, (120, 80), (280, 80), ink, 2)
+    cv2.line(img, (280, 80), (170, 330), ink, 2)
+    assert (binarize(img) == 0).any()
+
+
+def test_ink_across_a_deep_shadow_is_accepted():
+    shadow = np.tile(np.linspace(245, 90, 400), (400, 1))
+    mask = np.zeros((400, 400), np.uint8)
+    cv2.line(mask, (120, 80), (280, 330), 255, 4)
+    shadow[mask > 0] *= 0.45
+    assert (binarize(shadow.astype(np.uint8), method="adaptive") == 0).any()
+
+
+def test_guard_works_on_tiny_and_huge_images():
+    """28x28 input (no downscaling for the background) and a 12 MP photo (heavy downscaling)."""
+    tiny = np.full((28, 28), 255, np.uint8)
+    tiny[6:22, 12:16] = 0
+    assert (binarize(tiny, blur_ksize=0) == 0).any()
+
+    huge = np.full((3000, 4000), 228, np.uint8)
+    cv2.line(huge, (1800, 800), (2200, 2200), 40, 12)
+    assert (binarize(huge) == 0).any()
+    with pytest.raises(NoInkFoundError):
+        binarize(np.full((3000, 4000), 228, np.uint8))
+
+
+def test_min_contrast_zero_disables_guard():
+    rng = np.random.default_rng(0)
+    page = (np.full((100, 100), 232.0) + rng.normal(0, 8, (100, 100))).clip(0, 255).astype(np.uint8)
+    out = binarize(page, min_contrast=0)  # old behaviour: noise is split into two classes
+    assert set(np.unique(out)) == {0, 255}
+
+
+def test_preprocess_blank_noisy_paper_raises():
+    """The visual-check bug: noisy blank paper used to come out as a solid white 'digit'."""
+    rng = np.random.default_rng(0)
+    page = (np.full((400, 400), 232.0) + rng.normal(0, 6, (400, 400))).clip(0, 255).astype(np.uint8)
+    with pytest.raises(NoInkFoundError):
+        preprocess(page)
+
+
+def test_preprocess_options_pass_min_contrast():
+    img = np.full((400, 400), 230, np.uint8)
+    cv2.line(img, (120, 80), (280, 300), 200, 2)  # very faint: contrast ~18.5, above the default 15
+    assert preprocess(img).image.max() > 0
+    with pytest.raises(NoInkFoundError):
+        preprocess(img, PreprocessOptions(min_contrast=40))  # a stricter setting rejects it
