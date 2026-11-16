@@ -1,0 +1,13 @@
+[project]
+name = "digitrec"
+version = "0.1.0"
+description = "Recognize handwritten digits in photos using a pluggable PyTorch model backend."
+readme = "README.md"
+# 3.13 is the target; drop to ">=3.12" if a required wheel (e.g. torch) is missing for 3.13.
+requires-python = ">=3.13"
+dependencies = []
+
+[build-system]
+# uv's own build backend; it expects the package at src/<name>/ (src layout).
+requires = ["uv_build>=0.13,<0.14"]
+build-backend = "uv_build"

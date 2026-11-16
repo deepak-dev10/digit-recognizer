@@ -1,0 +1,26 @@
+# Python bytecode and build output
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.egg-info/
+
+# Virtual environment created by `uv sync`
+.venv/
+
+# Test / tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Phase 2 trained weights — large, reproducible from training/train.py
+checkpoints/
+
+# Downloaded datasets (torchvision MNIST etc.) and a project-local Hugging Face cache, if used
+data/
+.hf_cache/
+
+# OS / editor noise
+.DS_Store
+.vscode/
+.idea/
