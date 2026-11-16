@@ -15,16 +15,29 @@ This module is built in small steps. So far:
 * :func:`thicken_strokes`: optional dilation of thin pen strokes, applied to the crop
   before :func:`fit_to_box` (see its docstring for why the order matters).
 * :func:`center_by_mass`: place it in a 28x28 frame with its centre of mass in the middle.
+* :func:`to_tensor`: turn the 28x28 image into the ``[1, 28, 28]`` float tensor models take.
+
+The steps are chained in two halves, so a segmenter can sit in between::
+
+    prepare_page(source)      load → binarize → invert           once per image
+          │
+          ▼  (segmenter: whole page for one digit, one region per digit later)
+    normalize_digit(region)   crop → thicken → fit 20 px → centre 28x28 → tensor
+
+:func:`preprocess` runs both halves for the single-digit case. Every step's image is kept
+in ``stages`` so the UI and ``--show-debug`` can show exactly what the model saw.
 """
 
 from __future__ import annotations
 
 import io
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import BinaryIO, Literal
 
 import cv2
 import numpy as np
+import torch
 from PIL import Image, ImageOps
 
 #: Everything :func:`load_image` accepts:
@@ -436,3 +449,118 @@ def thicken_strokes(
     padded = cv2.copyMakeBorder(crop, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=0)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
     return cv2.dilate(padded, kernel)
+
+
+def to_tensor(image28: np.ndarray) -> torch.Tensor:
+    """Convert a 28x28 ``uint8`` digit to a ``[1, 28, 28]`` ``float32`` tensor in ``[0, 1]``.
+
+    This is the format of one crop in the :class:`~digitrec.models.base.Predictor` input
+    contract: values in [0, 1], white digit on black, **not** normalised (each backend
+    applies its own mean/std). The pipeline stacks these into an ``[N, 1, 28, 28]`` batch.
+    """
+    if image28.shape != (MNIST_SIZE, MNIST_SIZE):
+        raise ValueError(f"expected a {MNIST_SIZE}x{MNIST_SIZE} image, got shape {image28.shape}")
+    return torch.from_numpy(image28.astype(np.float32) / 255.0).unsqueeze(0)
+
+
+@dataclass(frozen=True)
+class PreprocessOptions:
+    """Knobs for the preprocessing chain; the defaults suit evenly lit photos and the canvas.
+
+    Attributes:
+        threshold: ``"otsu"`` or ``"adaptive"`` (photos with shadows), see :func:`binarize`.
+        blur_ksize: Gaussian blur kernel before thresholding; ``0`` disables it.
+        thicken: Dilate thin pen strokes, see :func:`thicken_strokes`. It does nothing to
+            strokes that are already MNIST-thick, so it's on by default.
+    """
+
+    threshold: ThresholdMethod = "otsu"
+    blur_ksize: int = 5
+    thicken: bool = True
+
+
+@dataclass
+class PreprocessResult:
+    """Output of preprocessing one digit.
+
+    Attributes:
+        image: The final ``28x28`` ``uint8`` MNIST-style digit (for display).
+        tensor: The same as a ``[1, 28, 28]`` float tensor in ``[0, 1]`` (for the model).
+        stages: Every intermediate image in pipeline order, keyed by step name:
+            ``grayscale``, ``binary``, ``white_on_black`` (page half) then ``crop``,
+            ``thickened``, ``fit_20px``, ``mnist_28x28`` (digit half). ``thickened`` equals
+            ``crop`` when no thickening was needed.
+    """
+
+    image: np.ndarray
+    tensor: torch.Tensor
+    stages: dict[str, np.ndarray] = field(default_factory=dict)
+
+
+def prepare_page(
+    source: ImageSource, options: PreprocessOptions | None = None
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    """First half of preprocessing, for the whole image: load, binarize, invert.
+
+    Args:
+        source: Any :data:`ImageSource`.
+        options: Preprocessing knobs; ``None`` means the defaults.
+
+    Returns:
+        ``(white_on_black, stages)``: the binary page with white ink on black, ready
+        for a segmenter, and the intermediate images (``grayscale``, ``binary``,
+        ``white_on_black``).
+    """
+    options = options or PreprocessOptions()
+    gray = load_image(source)
+    binary = binarize(gray, method=options.threshold, blur_ksize=options.blur_ksize)
+    page = ensure_white_on_black(binary)
+    return page, {"grayscale": gray, "binary": binary, "white_on_black": page}
+
+
+def normalize_digit(region: np.ndarray, options: PreprocessOptions | None = None) -> PreprocessResult:
+    """Second half of preprocessing, for one digit: crop, thicken, fit 20 px, centre, tensor.
+
+    Args:
+        region: White-on-black binary image containing exactly one digit, e.g. the whole
+            page from :func:`prepare_page` (single digit) or one segmented region (multi-digit).
+        options: Preprocessing knobs; ``None`` means the defaults.
+
+    Returns:
+        A :class:`PreprocessResult` whose ``stages`` holds this half's steps only.
+
+    Raises:
+        NoInkFoundError: ``region`` has no ink.
+    """
+    options = options or PreprocessOptions()
+    crop = crop_to_ink(region)
+    thick = thicken_strokes(crop) if options.thicken else crop
+    fitted = fit_to_box(thick)
+    image28 = center_by_mass(fitted)
+    stages = {"crop": crop, "thickened": thick, "fit_20px": fitted, "mnist_28x28": image28}
+    return PreprocessResult(image=image28, tensor=to_tensor(image28), stages=stages)
+
+
+def preprocess(source: ImageSource, options: PreprocessOptions | None = None) -> PreprocessResult:
+    """Turn a single-digit image into an MNIST-style 28x28 digit (stages 1–2 end to end).
+
+    Example::
+
+        result = preprocess("samples/seven.jpg")
+        result.tensor.shape    # torch.Size([1, 28, 28])
+        list(result.stages)    # ['grayscale', 'binary', 'white_on_black', 'crop', ...]
+
+    Args:
+        source: Any :data:`ImageSource` containing one handwritten digit.
+        options: Preprocessing knobs; ``None`` means the defaults.
+
+    Returns:
+        A :class:`PreprocessResult` with the final image, tensor and *all* stages.
+
+    Raises:
+        NoInkFoundError: Nothing that looks like ink was found.
+    """
+    page, page_stages = prepare_page(source, options)
+    result = normalize_digit(page, options)
+    result.stages = {**page_stages, **result.stages}
+    return result

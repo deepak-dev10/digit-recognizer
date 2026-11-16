@@ -5,10 +5,12 @@ import io
 import cv2
 import numpy as np
 import pytest
+import torch
 from PIL import Image, UnidentifiedImageError
 
 from digitrec.preprocessing import (
     NoInkFoundError,
+    PreprocessOptions,
     background_is_light,
     binarize,
     center_by_mass,
@@ -17,7 +19,11 @@ from digitrec.preprocessing import (
     estimate_stroke_width,
     fit_to_box,
     load_image,
+    normalize_digit,
+    prepare_page,
+    preprocess,
     thicken_strokes,
+    to_tensor,
 )
 
 # --- load_image ---------------------------------------------------------------------------
@@ -419,3 +425,75 @@ def test_thickening_pads_so_edge_strokes_are_not_clipped():
 def test_thicken_blank_returns_copy():
     blank = np.zeros((10, 10), np.uint8)
     assert (thicken_strokes(blank) == 0).all()
+
+
+# --- to_tensor / prepare_page / normalize_digit / preprocess ------------------------------
+
+
+def _photo_of_seven(stroke=6) -> bytes:
+    """A fake phone photo: dark-ink '7' on light, slightly noisy paper, JPEG-compressed."""
+    rng = np.random.default_rng(0)
+    page = np.full((480, 360), 225, np.uint8)
+    cv2.line(page, (100, 120), (260, 120), 30, stroke)  # top bar
+    cv2.line(page, (260, 120), (160, 380), 30, stroke)  # diagonal stem
+    noisy = (page + rng.normal(0, 6, page.shape)).clip(0, 255).astype(np.uint8)
+    return _encode(Image.fromarray(noisy), fmt="JPEG", quality=85)
+
+
+def test_to_tensor_shape_range_and_dtype():
+    img = np.zeros((28, 28), np.uint8)
+    img[10, 10] = 255
+    t = to_tensor(img)
+    assert t.shape == (1, 28, 28) and t.dtype == torch.float32
+    assert t.min() == 0.0 and t.max() == 1.0
+
+
+def test_to_tensor_rejects_wrong_size():
+    with pytest.raises(ValueError, match="28x28"):
+        to_tensor(np.zeros((20, 20), np.uint8))
+
+
+def test_preprocess_photo_end_to_end():
+    result = preprocess(_photo_of_seven())
+
+    assert result.image.shape == (28, 28) and result.image.dtype == np.uint8
+    assert result.tensor.shape == (1, 28, 28)
+    np.testing.assert_allclose(result.tensor[0].numpy(), result.image / 255.0, atol=1e-6)
+
+    img = result.image
+    assert img[0, 0] == 0 and img.max() == 255             # white digit on black
+    ink_rows = np.flatnonzero(img.any(axis=1))
+    ink_cols = np.flatnonzero(img.any(axis=0))
+    assert max(np.ptp(ink_rows), np.ptp(ink_cols)) + 1 == 20   # longest side is 20 px
+    assert img[:2].max() == 0 and img[:, :2].max() == 0    # empty margin around the digit
+
+
+def test_preprocess_records_all_stages_in_order():
+    result = preprocess(_photo_of_seven())
+    assert list(result.stages) == [
+        "grayscale", "binary", "white_on_black", "crop", "thickened", "fit_20px", "mnist_28x28",
+    ]
+    assert result.stages["grayscale"].shape == (480, 360)
+    assert result.stages["mnist_28x28"] is result.image
+
+
+def test_thin_pen_photo_is_thickened_and_option_disables_it():
+    data = _photo_of_seven(stroke=2)
+    on = preprocess(data)
+    off = preprocess(data, PreprocessOptions(thicken=False))
+    assert on.stages["thickened"].shape != on.stages["crop"].shape  # dilation padded the crop
+    assert off.stages["thickened"] is off.stages["crop"]
+    assert (on.image > 127).sum() > (off.image > 127).sum()         # bolder strokes
+
+
+def test_prepare_page_then_normalize_digit_matches_preprocess():
+    """The two halves composed by hand give the same digit as preprocess()."""
+    page, page_stages = prepare_page(_photo_of_seven())
+    assert set(page_stages) == {"grayscale", "binary", "white_on_black"}
+    digit = normalize_digit(page)
+    np.testing.assert_array_equal(digit.image, preprocess(_photo_of_seven()).image)
+
+
+def test_preprocess_blank_page_raises():
+    with pytest.raises(NoInkFoundError):
+        preprocess(np.full((100, 100), 240, np.uint8))
