@@ -24,3 +24,6 @@ data/
 .DS_Store
 .vscode/
 .idea/
+
+# Output of scripts/show_stages.py
+debug/

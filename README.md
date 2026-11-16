@@ -33,10 +33,28 @@ uv run python -c "import digitrec; print(digitrec.__version__)"
 
 On Apple Silicon, PyTorch uses the `mps` GPU backend automatically when available.
 
+## Visual check of preprocessing
+
+`scripts/show_stages.py` runs images through the preprocessing chain and writes one
+self-contained HTML page showing every intermediate image (grayscale → binary →
+white-on-black → crop → thickened → 20 px → final 28×28):
+
+```bash
+uv run python scripts/show_stages.py --open                   # built-in demo inputs
+uv run python scripts/show_stages.py samples/*.jpg --open     # your own photos
+uv run python scripts/show_stages.py img.jpg --threshold adaptive --no-thicken
+uv run python scripts/show_stages.py --mnist 5                # + real MNIST round trips
+```
+
+Output goes to `debug/stages.html` (gitignored). The script prints one line per input and
+exits non-zero if any input ended unexpectedly, e.g. an unreadable file.
+
 ## Project layout
 
 ```text
 src/digitrec/   # the library: preprocessing, segmentation, models, pipeline
+scripts/        # developer tools (show_stages.py: visual check of preprocessing)
+tests/          # pytest suite: uv run pytest
 plan.md         # design and phase checklists
 ```
 
