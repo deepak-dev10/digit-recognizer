@@ -316,18 +316,25 @@ def test_center_by_mass_output_is_28x28_uint8():
 def test_symmetric_digit_is_centered():
     out = center_by_mass(np.full((20, 10), 255, np.uint8))
     cy, cx = _center_of_mass(out)
-    assert abs(cy - 13.5) <= 0.5 and abs(cx - 13.5) <= 0.5
+    assert abs(cy - 14) <= 0.5 and abs(cx - 14) <= 0.5
+
+
+def test_center_of_mass_lands_on_pixel_14_like_mnist():
+    """MNIST's measured convention is (14, 14), not the geometric centre 13.5."""
+    dot = np.full((3, 3), 255, np.uint8)  # centre of mass exactly at its middle pixel
+    cy, cx = _center_of_mass(center_by_mass(dot))
+    assert (cy, cx) == (14.0, 14.0)
 
 
 def test_lopsided_digit_centered_by_mass_not_box():
-    """A '7'-like shape: a heavy top bar plus a thin stem. Its mass sits high in its box."""
+    """A '7'-like shape: a heavy top bar plus a stem. Its mass sits high in its box."""
     seven = np.zeros((20, 14), np.uint8)
-    seven[:5, :] = 255       # thick top bar
-    seven[5:, 6:8] = 255     # thin stem
+    seven[:4, :] = 255       # thick top bar
+    seven[4:, 5:9] = 255     # stem
     out = center_by_mass(seven)
 
     cy, cx = _center_of_mass(out)
-    assert abs(cy - 13.5) <= 0.5 and abs(cx - 13.5) <= 0.5  # mass is centred…
+    assert abs(cy - 14) <= 0.5 and abs(cx - 14) <= 0.5  # mass is centred…
     rows_with_ink = np.flatnonzero(out.any(axis=1))
     assert rows_with_ink[0] > 4  # …so the digit sits lower than box-centring (top row 4) would put it
 

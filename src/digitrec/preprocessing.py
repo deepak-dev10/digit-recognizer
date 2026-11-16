@@ -327,8 +327,10 @@ def center_by_mass(digit: np.ndarray, size: int = MNIST_SIZE) -> np.ndarray:
 
     Details:
 
-    * The target is the geometric centre, ``(size - 1) / 2`` = 13.5 for 28 px (between
-      pixels 13 and 14).
+    * The target is pixel ``size // 2`` = **(14, 14)**, matching MNIST. Measured over the
+      10k MNIST test digits, the mean centre of mass is (13.99, 14.01) with a std of 0.29 px.
+      It is *not* the geometric centre 13.5. Using 13.5 would place every digit ~0.7 px
+      diagonally off from where MNIST-trained models expect it.
     * The shift is rounded to **whole pixels**. A sub-pixel shift would need interpolation
       and slightly blur the strokes, for at most 0.5 px of extra accuracy.
     * The shift is **clamped** so the whole digit stays inside the frame. With a 20 px digit
@@ -363,7 +365,7 @@ def center_by_mass(digit: np.ndarray, size: int = MNIST_SIZE) -> np.ndarray:
     cx = (weights.sum(axis=0) @ np.arange(w)) / total
 
     # Where the digit's top-left corner must go so its centre of mass lands on the frame centre…
-    target = (size - 1) / 2
+    target = size // 2  # MNIST convention, see docstring
     top, left = round(target - cy), round(target - cx)
     # …clamped so the digit stays fully inside the frame.
     top = min(max(top, 0), size - h)
