@@ -12,6 +12,8 @@ This module is built in small steps. So far:
 * :func:`binarize`: denoise and threshold to pure black/white (0 or 255).
 * :func:`ensure_white_on_black`: invert if needed so the digit is white on black, like MNIST.
 * :func:`crop_to_ink` + :func:`fit_to_box`: cut away empty margins, scale the digit to 20 px.
+* :func:`thicken_strokes`: optional dilation of thin pen strokes, applied to the crop
+  before :func:`fit_to_box` (see its docstring for why the order matters).
 * :func:`center_by_mass`: place it in a 28x28 frame with its centre of mass in the middle.
 """
 
@@ -357,3 +359,80 @@ def center_by_mass(digit: np.ndarray, size: int = MNIST_SIZE) -> np.ndarray:
     frame = np.zeros((size, size), np.uint8)
     frame[top : top + h, left : left + w] = digit
     return frame
+
+
+# Stroke width as a fraction of the digit's longest side, measured on 2,000 MNIST test
+# digits (binarised at 127): 5th percentile 0.076, 10th 0.084, median 0.112.
+#: Below this ratio a stroke counts as "too thin" (thinner than ~93% of MNIST digits).
+MIN_STROKE_RATIO = 0.08
+#: When thickening, aim for the MNIST median.
+TARGET_STROKE_RATIO = 0.11
+
+
+def estimate_stroke_width(binary: np.ndarray) -> float:
+    """Estimate the average stroke width of a white-on-black binary image, in pixels.
+
+    Uses ``width ≈ 2 x area / perimeter``. A stroke of width ``W`` and length ``L`` has
+    area ``W·L`` and an outline of about ``2·L``, so the ratio gives ``W`` for any long thin
+    shape, curved or straight, without needing to skeletonise the digit.
+    Inner outlines (the holes in 0, 6, 8, 9) are included in the perimeter, as they should be.
+
+    Args:
+        binary: ``HxW`` ``uint8`` image, ink > 0 on a 0 background.
+
+    Returns:
+        Estimated width in pixels; ``0.0`` if there is no ink.
+    """
+    mask = (binary > 0).astype(np.uint8)
+    contours, _ = cv2.findContours(mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+    perimeter = sum(cv2.arcLength(c, True) for c in contours)
+    if perimeter == 0:
+        return 0.0
+    return 2.0 * float(mask.sum()) / perimeter
+
+
+def thicken_strokes(
+    crop: np.ndarray,
+    *,
+    min_ratio: float = MIN_STROKE_RATIO,
+    target_ratio: float = TARGET_STROKE_RATIO,
+) -> np.ndarray:
+    """Dilate thin strokes so they survive downscaling (optional stage 2c+).
+
+    **Why:** a fine pen on a high-resolution photo might draw 5 px strokes on a 600 px tall
+    digit. :func:`fit_to_box` shrinks that by 30x, so the stroke becomes ~0.2 px, a faint
+    grey ghost the model barely sees. MNIST strokes are about 11% of the digit's size.
+
+    **When:** call it on the tight crop from :func:`crop_to_ink`, *before* :func:`fit_to_box`.
+    The stroke width has to be judged relative to the digit's own size, and once the digit
+    is shrunk to 20 px the information is already lost.
+
+    **What it does:** if the estimated width is below ``min_ratio`` x the digit's longest
+    side, it dilates with an elliptical kernel (round, so strokes grow evenly in every
+    direction) until the width is about ``target_ratio`` x the side. Strokes that are thick
+    enough are returned unchanged (as a copy). The crop is padded first, so strokes at the
+    edge grow outwards instead of being clipped. The result is therefore slightly larger.
+
+    Args:
+        crop: ``HxW`` ``uint8`` white-on-black **binary** crop (output of :func:`crop_to_ink`).
+        min_ratio: Thicken only below this width/size ratio. Default from MNIST statistics.
+        target_ratio: Width/size ratio to aim for when thickening (MNIST median).
+
+    Returns:
+        ``uint8`` crop, possibly larger than the input by the kernel size.
+    """
+    if crop.ndim != 2:
+        raise ValueError(f"expected a 2-D image, got shape {crop.shape}")
+
+    side = max(crop.shape)
+    width = estimate_stroke_width(crop)
+    if width == 0 or width >= min_ratio * side:
+        return crop.copy()
+
+    # Dilating with a k x k kernel widens a stroke by k - 1 px. Kernel sizes must be odd
+    # so the kernel has a centre pixel.
+    k = _odd_at_least_3(round(target_ratio * side - width) + 1)
+    pad = k // 2
+    padded = cv2.copyMakeBorder(crop, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=0)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    return cv2.dilate(padded, kernel)

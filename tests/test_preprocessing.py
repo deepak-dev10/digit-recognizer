@@ -2,6 +2,7 @@
 
 import io
 
+import cv2
 import numpy as np
 import pytest
 from PIL import Image, UnidentifiedImageError
@@ -13,8 +14,10 @@ from digitrec.preprocessing import (
     center_by_mass,
     crop_to_ink,
     ensure_white_on_black,
+    estimate_stroke_width,
     fit_to_box,
     load_image,
+    thicken_strokes,
 )
 
 # --- load_image ---------------------------------------------------------------------------
@@ -347,3 +350,72 @@ def test_center_by_mass_rejects_bad_input():
         center_by_mass(np.full((30, 10), 255, np.uint8))
     with pytest.raises(ValueError, match="2-D"):
         center_by_mass(np.zeros((5, 5, 3), np.uint8))
+
+
+# --- estimate_stroke_width / thicken_strokes ----------------------------------------------
+
+
+@pytest.mark.parametrize("width", [3, 6, 12])
+def test_estimate_stroke_width_on_straight_stroke(width):
+    img = np.zeros((220, 60), np.uint8)
+    img[10:210, 20 : 20 + width] = 255  # 200 px long vertical stroke
+    assert estimate_stroke_width(img) == pytest.approx(width, rel=0.1)
+
+
+def test_estimate_stroke_width_on_ring():
+    """A '0': the hole's outline counts too, so a ring of width 8 measures ~8."""
+    img = np.zeros((200, 200), np.uint8)
+    cv2.circle(img, (100, 100), 80, 255, thickness=8)
+    assert estimate_stroke_width(img) == pytest.approx(8, rel=0.15)
+
+
+def test_estimate_stroke_width_blank_is_zero():
+    assert estimate_stroke_width(np.zeros((10, 10), np.uint8)) == 0.0
+
+
+def _thin_seven(stroke=4, size=400) -> np.ndarray:
+    """A fine-pen '7' on a big crop: stroke/size = 0.01, far thinner than MNIST."""
+    img = np.zeros((size, size), np.uint8)
+    cv2.line(img, (0, 0), (size - 1, 0), 255, stroke)
+    cv2.line(img, (size - 1, 0), (size // 3, size - 1), 255, stroke)
+    return crop_to_ink(img)
+
+
+def test_thin_strokes_are_thickened_to_mnist_like_ratio():
+    crop = _thin_seven()
+    out = thicken_strokes(crop)
+    ratio = estimate_stroke_width(out) / max(out.shape)
+    assert estimate_stroke_width(crop) / max(crop.shape) < 0.02  # started very thin
+    assert 0.08 <= ratio <= 0.14                                  # now within MNIST's typical range
+
+
+def test_thickening_keeps_strokes_after_resize():
+    """The point of the step: after fit_to_box, a thickened stroke still has solid pixels."""
+    crop = _thin_seven()
+    assert fit_to_box(crop).max() < 128           # without: only a faint grey ghost remains
+    assert fit_to_box(thicken_strokes(crop)).max() == 255
+
+
+def test_thick_strokes_are_left_alone():
+    img = np.zeros((100, 100), np.uint8)
+    img[10:90, 40:55] = 255  # width 15 on an 80 px digit: ratio ~0.19, thicker than MNIST median
+    crop = crop_to_ink(img)
+    out = thicken_strokes(crop)
+    np.testing.assert_array_equal(out, crop)
+    assert out is not crop
+
+
+def test_thickening_pads_so_edge_strokes_are_not_clipped():
+    """The 7's top bar lies on the crop's top edge; dilation must grow it upwards, not cut it."""
+    crop = _thin_seven()
+    out = thicken_strokes(crop)
+    pad = (out.shape[0] - crop.shape[0]) // 2
+    h, w = crop.shape
+    assert pad > 0
+    assert (out[pad : pad + h, pad : pad + w][crop > 0] > 0).all()  # every original ink pixel kept
+    assert out[:pad].any()  # ink grew into the padding above the original top edge
+
+
+def test_thicken_blank_returns_copy():
+    blank = np.zeros((10, 10), np.uint8)
+    assert (thicken_strokes(blank) == 0).all()
